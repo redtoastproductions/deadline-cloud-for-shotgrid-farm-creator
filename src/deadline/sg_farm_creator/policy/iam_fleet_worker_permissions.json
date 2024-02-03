@@ -1,0 +1,47 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "deadline:AssumeFleetRoleForWorker",
+                "deadline:UpdateWorker",
+                "deadline:DeleteWorker",
+                "deadline:UpdateWorkerSchedule",
+                "deadline:BatchGetJobEntity",
+                "deadline:AssumeQueueRoleForWorker"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:PrincipalAccount": "${aws:ResourceAccount}"
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogStream"
+            ],
+            "Resource": "arn:aws:logs:*:*:*:/aws/deadline/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:PrincipalAccount": "${aws:ResourceAccount}"
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:PutLogEvents",
+                "logs:GetLogEvents"
+            ],
+            "Resource": "arn:aws:logs:*:*:*:/aws/deadline/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:PrincipalAccount": "${aws:ResourceAccount}"
+                }
+            }
+        }
+    ]
+}

@@ -32,6 +32,10 @@ Starting from the root directory of this repository:
 The farm creator uses the Deadline Cloud log level. You can change it with:
 `deadline config set settings.log_level LOG_LEVEL`
 
+**Command line invocation**
+
+`python creator.py -s (studio id) -f (farm name) -q (queue name) -l (fleet name)
+
 ## License
 
 This project is licensed under the Apache-2.0 License.

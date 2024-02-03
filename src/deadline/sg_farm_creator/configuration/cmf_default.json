@@ -1,0 +1,11 @@
+{
+    "customerManaged": {
+        "mode": "NO_SCALING",
+        "workerRequirements": {
+            "vCpuCount": {"min": 1},
+            "memoryMiB": {"min": 512},
+            "osFamily": "linux",
+            "cpuArchitectureType": "x86_64"
+        }
+    }
+}

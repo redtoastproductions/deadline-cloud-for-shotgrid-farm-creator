@@ -1,3 +1,5 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
 import logging
 from datetime import datetime
 from pathlib import Path

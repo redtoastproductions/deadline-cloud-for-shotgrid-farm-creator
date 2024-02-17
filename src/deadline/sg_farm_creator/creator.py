@@ -1,3 +1,5 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
 import argparse
 import json
 import logging
@@ -23,7 +25,9 @@ log_fmt = logging.Formatter(
 log_handler.setFormatter(log_fmt)
 logger.addHandler(log_handler)
 
-ROLE_CHANGE_WAIT_SECONDS = 8
+
+FLEET_CONFIGURATION_PATH = "configuration/cmf_default.json"
+ROLE_CHANGE_WAIT_SECONDS = 6
 
 
 def get_json_document(json_path=None):
@@ -72,7 +76,8 @@ def create_farm_and_fleet(
     name_fleet=None,
     fleet_configuration_path=None,
     max_worker_count=None,
-    job_run_as_user=None
+    job_run_as_user=None,
+    job_attachment_settings=None
 ):
     """
     Creates a Deadline Cloud farm and customer-managed fleet
@@ -80,32 +85,59 @@ def create_farm_and_fleet(
     
     Args:
         studio_id: (str) Nimble Studio ID
-        name_farm: (str) Farm display name (must be unique on the region)
-        name_queue: (str) Queue display name
-        name_fleet: (str) Fleet display name
+        name_farm: (str) (required) Farm display name (must be unique on the region)
+        name_queue: (str) (required) Queue display name
+        name_fleet: (str) (required) Fleet display name
         fleet_configuration_path: (str) Path to fleet configuration JSON
         max_worker_count: (int) Maximum worker count for auto scaling
         job_run_as_user: (dict) Job session RunAs user info object
+        job_attachment_settings: (dict) Job attachment settings for created queue
     
     Return:
-        (dict) Created farm
+        (dict) Info on created resources, or an error
     """
+    
+    # Validate input
+    if name_farm is None:
+        error_msg = "No farm name specified"
+        logger.error(error_msg)
+        return {"error": error_msg}
+    
+    if name_queue is None:
+        error_msg = "No queue name specified"
+        logger.error(error_msg)
+        return {"error": error_msg}
+    
+    if name_fleet is None:
+        error_msg = "No fleet name specified"
+        logger.error(error_msg)
+        return {"error": error_msg}
+    
+    
+    # Replace spaces with underscores to build the role name
+    name_farm_sanitized = name_farm.replace(" ", "_")
+    role_name_fleet = f"{name_farm_sanitized}FleetRole"
     
     # Get caller identity for account ID and fleet role ARN
     fleet_role_arn = None
-    caller_identity_account = None
     try:
         caller_identity = deadline_cloud_util.get_caller_identity()
         if "Account" in caller_identity:
-            fleet_role_arn = f"arn:aws:iam::{caller_identity['Account']}:role/{name_farm}FleetRole"
-            caller_identity_account = caller_identity["Account"]
+            fleet_role_arn = f"arn:aws:iam::{caller_identity['Account']}:role/{role_name_fleet}"
             logger.debug(f"fleet_role_arn: {fleet_role_arn}")
+        else:
+            logger.error(f"Get caller identity didn't return Account")
     except:
         logger.debug(traceback.format_exc())
     
     if not fleet_role_arn:
-        logger.error(f"Get caller identity failed")
-        return None
+        error_msg = f"Get caller identity failed"
+        logger.error(error_msg)
+        return {"error": error_msg}
+    
+    
+    # Track progress for completion and clean_up
+    progress = {}
     
     
     # Create farm with specified name
@@ -113,17 +145,19 @@ def create_farm_and_fleet(
     try:
         farm_id = deadline_cloud_util.create_farm(
             display_name=name_farm,
-            studio_id=studio_id,
-            dry_run=True
+            studio_id=studio_id
         )
+        progress["farm_id"] = farm_id
     except:
-        logger.debug(traceback.format_exc())
-        farm_id = "farm-a54710bfe3aa41a2800ba0f2f815f569"
-        logger.debug(f"farm_id override: {farm_id}")
+        error_msg = traceback.format_exc()
+        logger.error(error_msg)
+        return {"error": error_msg}
+    
     
     if not farm_id:
-        logger.error("Farm creation failed")
-        return None
+        error_msg = "Farm creation failed"
+        logger.error(error_msg)
+        return {"error": error_msg}
     
     logger.debug(f"farm_id: {farm_id}")
     
@@ -135,15 +169,47 @@ def create_farm_and_fleet(
             display_name=name_queue,
             farm_id=farm_id,
             job_run_as_user=job_run_as_user,
-            dry_run=False
+            job_attachment_settings=job_attachment_settings
         )
     except:
         logger.debug(traceback.format_exc())
     
     if not queue_id:
-        return None
+        error_msg = "Queue creation failed"
+        logger.error(error_msg)
+        clean_up(progress)
+        return {"error": error_msg}
     
     logger.debug(f"queue_id: {queue_id}")
+    
+    
+    # Check that queue is available for interaction
+    queue_retries_total = 3
+    queue_retries = 0
+    while queue_retries < queue_retries_total:
+        queue_result = None
+        try:
+            queue_result = deadline_cloud_util.get_queue(
+                farm_id=farm_id,
+                queue_id=queue_id
+            )
+        except:
+            logger.debug(traceback.format_exc())
+        
+        if queue_result:
+            progress["queue_id"] = queue_result
+            break
+        else:
+            logger.warning("get_queue didn't return queueId")
+        
+        queue_retries += 1
+    
+    if not progress["queue_id"]:
+        error_msg = f"Couldn't get created queue after {queue_retries} retries"
+        logger.error(error_msg)
+        clean_up(progress)
+        return {"error": error_msg}
+    
     
     # Get fleet role policy document
     pd_fleet_role_dict = None
@@ -154,25 +220,38 @@ def create_farm_and_fleet(
         logger.debug(traceback.format_exc())
     
     if not pd_fleet_role_dict:
-        logger.error(f"Couldn't get fleet role policy document: {pd_fleet_role_path}")
-        return None
+        error_msg = f"Couldn't get fleet role policy document: {pd_fleet_role_path}"
+        logger.error(error_msg)
+        clean_up(progress)
+        return {"error": error_msg}
     
     
     # Update role policy document with AssumeRole conditions
     region_id = studio_id.split(":")[0]
-    if "Statement" in pd_fleet_role_dict:
+    if "Statement" in pd_fleet_role_dict and pd_fleet_role_dict["Statement"]:
         for s in pd_fleet_role_dict["Statement"]:
-            if s["Action"] == "sts:AssumeRole":
-                s["Condition"] = {
-                    "StringEquals": {"aws:SourceAccount": str(caller_identity_account)},
-                    "ArnEquals": {"aws:SourceArn": f"arn:aws:deadline:{region_id}:{str(caller_identity_account)}:farm/{farm_id}"}
-            }
+            try:
+                if s["Action"] == "sts:AssumeRole":
+                    s["Condition"] = {
+                        "StringEquals": {"aws:SourceAccount": str(caller_identity['Account'])},
+                        "ArnEquals": {"aws:SourceArn": f"arn:aws:deadline:{region_id}:{str(caller_identity['Account'])}:farm/{farm_id}"}
+                }
+            except:
+                error_msg = f"Couldn't set sts:AssumeRole condition"
+                logger.error(error_msg)
+                clean_up(progress)
+                return {"error": error_msg}
+    else:
+        error_msg = "Statement not found in fleet role dictionary"
+        logger.error(error_msg)
+        clean_up(progress)
+        return {"error": error_msg}
+    
     logger.debug(f"pd_fleet_role_dict: {pd_fleet_role_dict}")
     
     
     # Check if fleet role already exists
     role = None
-    role_name_fleet = f"{name_farm}FleetRole"
     try:
         role = deadline_cloud_util.get_role(role_name=role_name_fleet)
     except Exception as e:
@@ -191,12 +270,15 @@ def create_farm_and_fleet(
                 role_name=role_name_fleet,
                 assume_role_policy_document=json.dumps(pd_fleet_role_dict)
             )
+            progress["role_name"] = role_name_fleet
         except:
             logger.debug(traceback.format_exc())
         
         if not role:
-            logger.error(f"Fleet role creation failed")
-            return None
+            error_msg = f"Fleet role creation failed"
+            logger.error(error_msg)
+            clean_up(progress)
+            return {"error": error_msg}
         else:
             pass
     
@@ -211,28 +293,35 @@ def create_farm_and_fleet(
         logger.debug(traceback.format_exc())
     
     if not pd_worker_permissions:
-        logger.error(f"Couldn't get {policy_name} policy document: {pd_worker_permissions_path}")
-        return None
+        error_msg = f"Couldn't get {policy_name} policy document: {pd_worker_permissions_path}"
+        logger.error(error_msg)
+        clean_up(progress)
+        return {"error": error_msg}
     
     
     # Attach WorkerPermissions to the fleet role from the policy document
-    role_policy_result = None
+    role_policy = None
     try:
-        role_policy_result = deadline_cloud_util.put_role_policy(
+        role_policy = deadline_cloud_util.put_role_policy(
             role_name=role_name_fleet,
             policy_name=policy_name,
             policy_document=pd_worker_permissions
         )
+        progress["role_policy"] = {
+            "role_name": role_name_fleet,
+            "policy_name": policy_name
+        }
     except:
         logger.debug(traceback.format_exc())
     
-    if not role_policy_result:
-        logger.error(f"Fleet role creation failed")
-        return None
+    if not role_policy:
+        error_msg = f"Fleet role creation failed"
+        logger.error(error_msg)
+        clean_up(progress)
+        return {"error": error_msg}
         
         
     # Get fleet configuration document as a Python dict for input to create_fleet()
-    fleet_configuration_path = "configuration/cmf_default.json"
     fleet_configuration = None
     try:
         fleet_configuration = json.loads(get_json_document(fleet_configuration_path))
@@ -240,50 +329,117 @@ def create_farm_and_fleet(
         logger.debug(traceback.format_exc())
     
     if not fleet_configuration:
-        logger.error(f"Couldn't get fleet configuration document: {fleet_configuration_path}")
-        return None
-    
-    
-    # Wait at least 5 seconds for the fleet role permissions change to take effect.
-    # Without waiting, the sts:AssumeRole in create_fleet will fail.
-    time.sleep(ROLE_CHANGE_WAIT_SECONDS)
+        error_msg = f"Couldn't get fleet configuration document: {fleet_configuration_path}"
+        logger.error(error_msg)
+        clean_up(progress)
+        return {"error": error_msg}
     
     
     # Create a fleet with the user's specified configuration
-    fleet_id = None
-    try:
-        fleet_id = deadline_cloud_util.create_fleet(
-            display_name=name_fleet,
-            farm_id=farm_id,
-            role_arn=fleet_role_arn,
-            max_worker_count=max_worker_count,
-            configuration=fleet_configuration
-        )
-    except:
-        logger.debug(traceback.format_exc())
+    role_change_retries_total = 3
+    role_change_retries = 0
+    while role_change_retries < role_change_retries_total:
+        # Wait for the fleet role permissions change to take effect.
+        # Without waiting, the sts:AssumeRole in create_fleet will fail.
+        time.sleep(ROLE_CHANGE_WAIT_SECONDS)
+
+        # Create the fleet
+        fleet_id = None
+        try:
+            fleet_id = deadline_cloud_util.create_fleet(
+                display_name=name_fleet,
+                farm_id=farm_id,
+                role_arn=fleet_role_arn,
+                max_worker_count=max_worker_count,
+                configuration=fleet_configuration
+            )
+            logger.debug(f"fleet_id: {fleet_id}")
+        except:
+            logger.debug(traceback.format_exc())
+    
+        if fleet_id:
+            break
+        
+        role_change_retries += 1
     
     if not fleet_id:
-        logger.error(f"Fleet creation failed")
-        return None
+        error_msg = f"Fleet creation failed after {role_change_retries} retries. Please check fleet role: {fleet_role_arn}"
+        logger.error(error_msg)
+        clean_up(progress)
+        return {"error": error_msg}
     
     
-    # Create a fleet-to-queue association
+    # Create a queue-fleet association
     associate_result = None
+    logger.debug("create_queue_fleet_association")
     try:
         associate_result = deadline_cloud_util.create_queue_fleet_association(
             farm_id=farm_id,
             queue_id=queue_id,
             fleet_id=fleet_id
         )
+        logger.debug(f"associate_result: {associate_result}")
     except:
         logger.debug(traceback.format_exc())
     
     if not associate_result:
-        logger.error(f"Fleet queue association failed")
-        return None
+        error_msg = f"Fleet queue association failed"
+        logger.error(error_msg)
+        clean_up(progress)
+        return {"error": error_msg}
     
     
-    return True
+    return progress
+
+
+def clean_up(resources=None):
+    """
+    Removes resources created during a farm creation run.
+    
+    Returns a key-for-key dictionary of results for each removal.
+    
+    Args:
+        resources: (dict) AWS resources to remove. _farm_id will not be removed.
+    
+    Return:
+        (dict) Results of each removal
+    """
+    
+    cleaned = {}
+    
+    logger.debug(f"resources: {resources}")
+    
+    if "role_policy" in resources:
+        logger.debug(f"delete role_policy {resources['role_policy']}")
+        try:
+            cleaned["delete_role_policy"] = deadline_cloud_util.delete_role_policy(
+                role_name=resources["role_policy"]["role_name"],
+                policy_name=resources["role_policy"]["policy_name"]
+            )
+        except:
+            logger.debug(traceback.format_exc())
+    
+    if "role_name" in resources:
+        try:
+            cleaned["role_name"] = deadline_cloud_util.delete_role(role_name=resources["role_name"])
+        except:
+            logger.debug(traceback.format_exc())
+
+    if "queue_id" in resources:
+        try:
+            cleaned["delete_queue"] = deadline_cloud_util.delete_queue(farm_id=resources["farm_id"], queue_id=resources["queue_id"])
+        except:
+            logger.debug(traceback.format_exc())
+    
+    if "farm_id" in resources:
+        try:
+            cleaned["delete_farm"] = deadline_cloud_util.delete_farm(farm_id=resources["farm_id"])
+        except:
+            logger.debug(traceback.format_exc())
+
+    logger.debug(f"cleaned: {cleaned}")
+    
+    return cleaned
 
 
 if __name__ == "__main__":
@@ -308,8 +464,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-fcp", "--fleet_configuration_path",
-        help="Fleet configuration path",
-        default="configuration/cmf_default.json"
+        help="Fleet configuration path"
     )
     parser.add_argument(
         "-m", "--max_worker_count",
@@ -326,16 +481,35 @@ if __name__ == "__main__":
         help="Posix job RunAs group name",
         default="jobgroup"
     )
+    parser.add_argument(
+        "-b", "--job_attachment_bucket",
+        help="S3 job attachment bucket name"
+    )
+    parser.add_argument(
+        "-p", "--root_prefix",
+        help="S3 job attachment root prefix"
+    )
+    parser.add_argument(
+        "-a", "--run_as",
+        help="Job runAs",
+        choices=["WORKER_AGENT_USER", "CONFIGURED_QUEUE_USER"],
+        default="WORKER_AGENT_USER"
+    )
     
     args = parser.parse_args(sys.argv[1:])
+    
+    fleet_configuration_path = None
+    if not args.fleet_configuration_path:
+        fleet_configuration_path = FLEET_CONFIGURATION_PATH
     
     _farm_result = create_farm_and_fleet(
         studio_id=args.studio_id,
         name_farm=args.farm,
         name_queue=args.queue,
         name_fleet=args.fleet,
-        fleet_configuration_path=args.fleet_configuration_path,
+        fleet_configuration_path=fleet_configuration_path,
         max_worker_count=int(args.max_worker_count),
-        job_run_as_user={"posix":{"user":args.user,"group":args.group}}
+        job_run_as_user={"posix":{"user":args.user,"group":args.group}, "runAs": args.run_as},
+        job_attachment_settings={"s3BucketName": args.job_attachment_bucket, "rootPrefix": args.root_prefix}
     )
     logger.info(_farm_result)

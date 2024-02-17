@@ -1,0 +1,21 @@
+{
+    "listener_host": "0.0.0.0",
+    "listener_port": "8090",
+    
+    "studio_id": "eu-central-1:stid-example1example2",
+    
+    "max_worker_count": 1,
+    
+    "job_run_as_user": {
+        "posix": {
+            "user": "jobuser",
+            "group": "jobgroup"
+        },
+        "runAs": "WORKER_AGENT_USER"
+    },
+    
+    "job_attachment_settings": {
+        "s3BucketName": "studioname-job-attachments",
+        "rootPrefix": "DeadlineCloud"
+    }
+}
